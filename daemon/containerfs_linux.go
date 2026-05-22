@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/containerd/log"
@@ -83,6 +84,13 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 			if err := mount.MakeRSlave("/"); err != nil {
 				return err
 			}
+
+			// Safely resolve the container root to prevent symlink escape attacks
+			containerRoot, err := symlink.FollowSymlinkInScope(container.BaseFS, "/")
+			if err != nil {
+				return fmt.Errorf("resolve container root: %w", err)
+			}
+
 			for _, m := range mounts {
 				dest, err := container.GetResourcePath(m.Destination)
 				if err != nil {
@@ -94,7 +102,8 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				if err != nil {
 					return err
 				}
-				if err := fileutils.CreateIfNotExists(dest, stat.IsDir()); err != nil {
+				// Use safe path resolution to prevent symlink escape attacks (CVE-2026-41568)
+				if err := createIfNotExists(containerRoot, strings.TrimPrefix(m.Destination, "/"), stat.IsDir()); err != nil {
 					return err
 				}
 
@@ -102,9 +111,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				if m.NonRecursive {
 					bindMode = "bind"
 				}
-				writeMode := "ro"
 				if m.Writable {
-					writeMode = "rw"
 					if m.ReadOnlyNonRecursive {
 						return errors.New("options conflict: Writable && ReadOnlyNonRecursive")
 					}
@@ -114,6 +121,36 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				}
 				if m.ReadOnlyNonRecursive && m.ReadOnlyForceRecursive {
 					return errors.New("options conflict: ReadOnlyNonRecursive && ReadOnlyForceRecursive")
+				}
+
+				// Open the mount target to pin the resolved inode. Using
+				// /proc/self/fd/<fd> as the mount target prevents any
+				// subsequent symlink swap from redirecting the mount.
+				targetFile, err := os.Open(dest)
+				if err != nil {
+					return fmt.Errorf("open mount target %q: %w", m.Destination, err)
+				}
+				targetPath := "/proc/self/fd/" + strconv.FormatUint(uint64(targetFile.Fd()), 10)
+
+				// The kernel rejects remount and propagation-change syscalls
+				// when the target is a /proc/self/fd path. Only the initial
+				// bind mount works on such paths, so we perform that via the
+				// fd path for TOCTOU safety and then resolve the real path for
+				// the read-only remount and propagation change.
+				if err := mount.Mount(m.Source, targetPath, "", bindMode); err != nil {
+					targetFile.Close()
+					return err
+				}
+				realPath, err := os.Readlink(targetPath)
+				if err != nil {
+					targetFile.Close()
+					return fmt.Errorf("readlink %s: %w", targetPath, err)
+				}
+				if !m.Writable {
+					if err := mount.Mount("", realPath, "", "ro,remount,bind"); err != nil {
+						targetFile.Close()
+						return err
+					}
 				}
 
 				// openContainerFS() is called for temporary mounts
@@ -126,20 +163,21 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				// all these mounts rprivate.  Do not use propagation
 				// property of volume as that should apply only when
 				// mounting happens inside the container.
-				opts := strings.Join([]string{bindMode, writeMode, "rprivate"}, ",")
-				if err := mount.Mount(m.Source, dest, "", opts); err != nil {
+				if err := mount.MakeRPrivate(realPath); err != nil {
+					targetFile.Close()
 					return err
 				}
 
 				if !m.Writable && !m.ReadOnlyNonRecursive {
-					if err := makeMountRRO(dest); err != nil {
+					if err := makeMountRRO(realPath); err != nil {
+						targetFile.Close()
 						if m.ReadOnlyForceRecursive {
 							return err
-						} else {
-							log.G(context.TODO()).WithError(err).Debugf("Failed to make %q recursively read-only", dest)
 						}
+						log.G(context.TODO()).WithError(err).Debugf("Failed to make %q recursively read-only", m.Destination)
 					}
 				}
+				targetFile.Close()
 			}
 
 			return mounttree.SwitchRoot(container.BaseFS)
@@ -258,4 +296,41 @@ func makeMountRRO(dest string) error {
 		err = fmt.Errorf("failed to apply MOUNT_ATTR_RDONLY with AT_RECURSIVE to %q: %w", dest, err)
 	}
 	return err
+}
+
+// createIfNotExists creates a file or a directory only if it does not already exist.
+// The unsafePath is scoped to containerRoot using symlink evaluation to prevent symlink escape attacks.
+func createIfNotExists(containerRoot, unsafePath string, isDir bool) error {
+	// Safely resolve the path within the container root to prevent symlink escapes
+	safePath, err := symlink.FollowSymlinkInScope(filepath.Join(containerRoot, unsafePath), containerRoot)
+	if err != nil {
+		return fmt.Errorf("resolve path within container: %w", err)
+	}
+
+	// Check if the path already exists
+	if _, err := os.Stat(safePath); err == nil {
+		// Path exists, nothing to do
+		return nil
+	} else if !os.IsNotExist(err) {
+		// Some other error occurred
+		return err
+	}
+
+	// Path doesn't exist, create it
+	if isDir {
+		return os.MkdirAll(safePath, 0o755)
+	}
+
+	// For files, ensure parent directory exists
+	parent := filepath.Dir(safePath)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+
+	// Create the file
+	f, err := os.OpenFile(safePath, os.O_CREATE|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }

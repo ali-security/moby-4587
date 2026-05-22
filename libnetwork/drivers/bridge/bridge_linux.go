@@ -463,6 +463,7 @@ func (d *driver) configure(option map[string]interface{}) error {
 		})
 	}
 
+	iptables.OnReloaded(d.handleFirewalldReload)
 	if config.EnableIPForwarding {
 		err = setupIPForwarding(config.EnableIPTables, config.EnableIP6Tables)
 		if err != nil {
@@ -799,12 +800,6 @@ func (d *driver) createNetwork(config *networkConfiguration) (err error) {
 
 		// Setup IP6Tables.
 		{config.EnableIPv6 && d.config.EnableIP6Tables, network.setupIP6Tables},
-
-		// We want to track firewalld configuration so that
-		// if it is started/reloaded, the rules can be applied correctly
-		{d.config.EnableIPTables, network.setupFirewalld},
-		// same for IPv6
-		{config.EnableIPv6 && d.config.EnableIP6Tables, network.setupFirewalld6},
 
 		// Setup DefaultGatewayIPv4
 		{config.DefaultGatewayIPv4 != nil, setupGatewayIPv4},
@@ -1297,6 +1292,11 @@ func (d *driver) Leave(nid, eid string) error {
 }
 
 func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
+	// Make sure the network isn't deleted, or in the middle of a firewalld reload, while
+	// updating its iptables rules.
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
+
 	network, err := d.getNetwork(nid)
 	if err != nil {
 		return err
@@ -1348,6 +1348,11 @@ func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string
 }
 
 func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
+	// Make sure this function isn't deleting iptables rules while handleFirewalldReloadNw
+	// is restoring those same rules.
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
+
 	network, err := d.getNetwork(nid)
 	if err != nil {
 		return err
@@ -1379,6 +1384,74 @@ func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
 	}
 
 	return nil
+}
+
+func (d *driver) handleFirewalldReload() {
+	if !d.config.EnableIPTables && !d.config.EnableIP6Tables {
+		return
+	}
+
+	d.Lock()
+	nids := make([]string, 0, len(d.networks))
+	for _, nw := range d.networks {
+		nids = append(nids, nw.id)
+	}
+	d.Unlock()
+
+	for _, nid := range nids {
+		d.handleFirewalldReloadNw(nid)
+	}
+}
+
+func (d *driver) handleFirewalldReloadNw(nid string) {
+	d.Lock()
+	defer d.Unlock()
+
+	if !d.config.EnableIPTables && !d.config.EnableIP6Tables {
+		return
+	}
+
+	// Make sure the network isn't being deleted, and ProgramExternalConnectivity/RevokeExternalConnectivity
+	// aren't modifying iptables rules, while restoring the rules.
+	d.configNetwork.Lock()
+	defer d.configNetwork.Unlock()
+
+	nw, ok := d.networks[nid]
+	if !ok {
+		return
+	}
+
+	if d.config.EnableIPTables {
+		if err := nw.setupIP4Tables(nw.config, nw.bridge); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"nid":   nw.id,
+				"error": err,
+			}).Error("Failed to re-create IPv4 packet filter on firewalld reload")
+		}
+	}
+	if nw.config.EnableIPv6 && d.config.EnableIP6Tables {
+		if err := nw.setupIP6Tables(nw.config, nw.bridge); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"nid":   nw.id,
+				"error": err,
+			}).Error("Failed to re-create IPv6 packet filter on firewalld reload")
+		}
+	}
+
+	if !nw.config.EnableICC {
+		for _, ep := range nw.endpoints {
+			if err := d.link(nw, ep, true); err != nil {
+				log.G(context.TODO()).WithFields(log.Fields{
+					"nid":   nw.id,
+					"eid":   ep.id,
+					"error": err,
+				}).Error("Failed to re-create link on firewalld reload")
+			}
+		}
+	}
+
+	nw.portMapper.ReMapAll()
+	nw.portMapperV6.ReMapAll()
 }
 
 func (d *driver) link(network *bridgeNetwork, endpoint *bridgeEndpoint, enable bool) (retErr error) {

@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/containerd/log"
 	dbus "github.com/godbus/dbus/v5"
@@ -39,8 +42,12 @@ type Conn struct {
 var (
 	connection *Conn
 
-	firewalldRunning bool      // is Firewalld service running
-	onReloaded       []*func() // callbacks when Firewalld has been reloaded
+	firewalldRunning bool // is Firewalld service running
+	// Time of the last firewalld reload.
+	firewalldReloadedAt atomic.Value
+	// Mutex to serialise firewalld reload callbacks.
+	firewalldReloadMu sync.Mutex
+	onReloaded        []*func() // callbacks when Firewalld has been reloaded
 )
 
 // firewalldInit initializes firewalld management code.
@@ -129,9 +136,12 @@ func connectionLost() {
 
 // call all callbacks
 func reloaded() {
+	firewalldReloadMu.Lock()
+	defer firewalldReloadMu.Unlock()
 	for _, pf := range onReloaded {
 		(*pf)()
 	}
+	firewalldReloadedAt.Store(time.Now())
 }
 
 // OnReloaded add callback
