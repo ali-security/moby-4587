@@ -8,10 +8,11 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - 'master'
+      - master
       - '[0-9]+.[0-9]+'
+      - main
     tags:
-      - 'v*'
+      - v*
   pull_request:
 
 env:
@@ -28,15 +29,13 @@ jobs:
     uses: ./.github/workflows/.dco.yml
 
   prepare:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     outputs:
       platforms: ${{ steps.platforms.outputs.matrix }}
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v3
-      -
-        name: Docker meta
+      - name: Docker meta
         id: meta
         uses: docker/metadata-action@v4
         with:
@@ -59,26 +58,23 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha
-      -
-        name: Rename meta bake definition file
+      - name: Rename meta bake definition file
         run: |
           mv "${{ steps.meta.outputs.bake-file }}" "/tmp/bake-meta.json"
-      -
-        name: Upload meta bake definition
-        uses: actions/upload-artifact@v3
+      - name: Upload meta bake definition
+        uses: actions/upload-artifact@v4
         with:
           name: bake-meta
           path: /tmp/bake-meta.json
           if-no-files-found: error
           retention-days: 1
-      -
-        name: Create platforms matrix
+      - name: Create platforms matrix
         id: platforms
         run: |
           echo "matrix=$(docker buildx bake bin-image-cross --print | jq -cr '.target."bin-image-cross".platforms')" >>${GITHUB_OUTPUT}
 
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs:
       - validate-dco
       - prepare
@@ -88,32 +84,26 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare.outputs.platforms) }}
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      -
-        name: Download meta bake definition
+      - name: Download meta bake definition
         uses: actions/download-artifact@v3
         with:
           name: bake-meta
           path: /tmp
-      -
-        name: Set up QEMU
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
-      -
-        name: Set up Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-      -
-        name: Login to Docker Hub
+      - name: Login to Docker Hub
         if: github.event_name != 'pull_request' && github.repository == 'moby/moby'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_MOBYBIN_USERNAME }}
           password: ${{ secrets.DOCKERHUB_MOBYBIN_TOKEN }}
-      -
-        name: Build
+      - name: Build
         id: bake
         uses: docker/bake-action@v3
         with:
@@ -125,17 +115,15 @@ jobs:
             *.platform=${{ matrix.platform }}
             *.output=type=image,name=${{ env.MOBYBIN_REPO_SLUG }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' && github.repository == 'moby/moby' }}
             *.tags=
-      -
-        name: Export digest
+      - name: Export digest
         if: github.event_name != 'pull_request' && github.repository == 'moby/moby'
         run: |
           mkdir -p /tmp/digests
           digest="${{ fromJSON(steps.bake.outputs.metadata)['bin-image']['containerimage.digest'] }}"
           touch "/tmp/digests/${digest#sha256:}"
-      -
-        name: Upload digest
+      - name: Upload digest
         if: github.event_name != 'pull_request' && github.repository == 'moby/moby'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: digests
           path: /tmp/digests/*
@@ -143,41 +131,35 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs:
       - build
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && github.event_name != 'pull_request' && github.repository == 'moby/moby'
     steps:
-      -
-        name: Download meta bake definition
+      - name: Download meta bake definition
         uses: actions/download-artifact@v3
         with:
           name: bake-meta
           path: /tmp
-      -
-        name: Download digests
+      - name: Download digests
         uses: actions/download-artifact@v3
         with:
           name: digests
           path: /tmp/digests
-      -
-        name: Set up Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-      -
-        name: Login to Docker Hub
+      - name: Login to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_MOBYBIN_USERNAME }}
           password: ${{ secrets.DOCKERHUB_MOBYBIN_TOKEN }}
-      -
-        name: Create manifest list and push
+      - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
           set -x
           docker buildx imagetools create $(jq -cr '.target."docker-metadata-action".tags | map("-t " + .) | join(" ")' /tmp/bake-meta.json) \
             $(printf '${{ env.MOBYBIN_REPO_SLUG }}@sha256:%s ' *)
-      -
-        name: Inspect image
+      - name: Inspect image
         run: |
           set -x
           docker buildx imagetools inspect ${{ env.MOBYBIN_REPO_SLUG }}:$(jq -cr '.target."docker-metadata-action".args.DOCKER_META_VERSION' /tmp/bake-meta.json)

@@ -8,8 +8,9 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - 'master'
+      - master
       - '[0-9]+.[0-9]+'
+      - main
   pull_request:
 
 env:
@@ -20,7 +21,7 @@ jobs:
     uses: ./.github/workflows/.dco.yml
 
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs:
       - validate-dco
     strategy:
@@ -30,30 +31,24 @@ jobs:
           - binary
           - dynbinary
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      -
-        name: Set up Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-      -
-        name: Build
+      - name: Build
         uses: docker/bake-action@v2
         with:
           targets: ${{ matrix.target }}
-      -
-        name: List artifacts
+      - name: List artifacts
         run: |
           tree -nh ${{ env.DESTDIR }}
-      -
-        name: Check artifacts
+      - name: Check artifacts
         run: |
           find ${{ env.DESTDIR }} -type f -exec file -e ascii -- {} +
-      -
-        name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: ${{ env.DESTDIR }}
@@ -61,28 +56,25 @@ jobs:
           retention-days: 7
 
   prepare-cross:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs:
       - validate-dco
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v3
-      -
-        name: Create matrix
+      - name: Create matrix
         id: platforms
         run: |
           matrix="$(docker buildx bake binary-cross --print | jq -cr '.target."binary-cross".platforms')"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
-      -
-        name: Show matrix
+      - name: Show matrix
         run: |
           echo ${{ steps.platforms.outputs.matrix }}
 
   cross:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs:
       - validate-dco
       - prepare-cross
@@ -91,37 +83,30 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare-cross.outputs.matrix) }}
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-      -
-        name: Prepare
+      - name: Prepare
         run: |
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-      -
-        name: Set up Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-      -
-        name: Build
+      - name: Build
         uses: docker/bake-action@v2
         with:
           targets: all
           set: |
             *.platform=${{ matrix.platform }}
-      -
-        name: List artifacts
+      - name: List artifacts
         run: |
           tree -nh ${{ env.DESTDIR }}
-      -
-        name: Check artifacts
+      - name: Check artifacts
         run: |
           find ${{ env.DESTDIR }} -type f -exec file -e ascii -- {} +
-      -
-        name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: cross-${{ env.PLATFORM_PAIR }}
           path: ${{ env.DESTDIR }}
